@@ -1,0 +1,33 @@
+# /etc/default/llama-idle-watchdog
+
+LLAMA_URL=http://127.0.0.1:8080
+LLAMA_SERVICE=llama-server.service
+
+# What to do after idle + GPU 0%:
+#   restart  — systemctl restart llama-server.service (fresh process)
+#   unload   — POST /models/unload for each loaded/sleeping model (router stays up)
+IDLE_ACTION=unload
+
+# Seconds with no work before taking IDLE_ACTION
+IDLE_SECONDS=600
+
+# How often to poll
+POLL_SECONDS=60
+
+# curl timeout for /health and /slots
+HEALTH_TIMEOUT=3
+
+# Minimum seconds between restarts
+COOLDOWN_SECONDS=120
+
+REQUIRE_SERVICE_ACTIVE=1
+STATE_DIR=/var/lib/llama-idle-watchdog
+
+# Router mode: leave empty to auto-discover via GET /models
+# Or set comma-separated ids, e.g. org/model:Q4_K_M
+LLAMA_MODELS=
+
+# Require this NVIDIA GPU to be 0% util before restart (1 = CUDA:1)
+CUDA_INDEX=0
+CUDA_IDLE_MAX_PCT=0
+REQUIRE_GPU_IDLE=1

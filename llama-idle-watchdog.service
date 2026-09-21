@@ -1,0 +1,18 @@
+[Unit]
+Description=Restart llama-server.service after 5 minutes of idle
+After=network.target llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/llama-idle-watchdog
+ExecStart=/usr/local/bin/llama-idle-watchdog.sh
+Restart=always
+RestartSec=5
+# Needs permission to restart llama-server.service
+# Either run as root (simple) or grant polkit / sudoers for the dedicated user.
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
