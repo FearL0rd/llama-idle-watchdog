@@ -1,37 +1,43 @@
 # llama-idle-watchdog
 
-A Linux systemd helper for **llama.cpp** `llama-server`.
+A Linux systemd helper for **llama.cpp** `llama-server` (single-model or
+router mode).
 
-After a long idle period or a large model IO cycle, coming back to the same
-process without a restart often fails (stale CUDA context, hung slots, model
-sleep/reload bugs). This watchdog watches the server and, only when it is
-truly idle, either **restarts `llama-server.service`** or **unloads loaded
-models** (`IDLE_ACTION`).
+After a long idle period or a large model IO cycle, using the same process
+again without a restart often fails (stale CUDA context, hung slots, sleep /
+reload bugs). This watchdog does **not** replace llama-server. It only
+decides when it is safe to **unload models** or **restart the unit**.
 
-It does **not** load models and does **not** replace llama-server. It only
-decides when an unload or a clean `systemctl restart` is safe.
+## What it does
 
-## What it fixes
+Every 15 seconds it:
 
-Typical failure:
+1. Confirms `llama-server.service` is active.
+2. Reads `GET /models` (which model is `loaded` / `loading` / `sleeping`).
+3. For each loaded model, reads `GET /slots?model=<id>&autoload=false`.
+4. Reads GPU util with `nvidia-smi -i $CUDA_INDEX`.
+5. If the API is busy or the GPU is above `CUDA_IDLE_MAX_PCT`, it resets the
+   idle clock.
+6. After **`IDLE_SECONDS`** (default 300) of no work **and** GPU util ≤
+   `CUDA_IDLE_MAX_PCT`, it runs **`IDLE_ACTION`**:
 
-1. A large GGUF is loaded on GPU 0 (`CUDA:0`).
-2. The server sits idle.
-3. You send a new request without restarting the unit.
-4. Inference fails or hangs.
+| `IDLE_ACTION` | Effect |
+| --- | --- |
+| `unload` (default) | `POST /models/unload` for each loaded / sleeping / loading model. The router stays up; the next request can autoload. |
+| `restart` | `systemctl restart llama-server.service` |
 
-Workaround this tool automates: if there has been no real work for **5 minutes**
-**and** GPU 1 is at **0%** utilization, take `IDLE_ACTION` (`restart` by
-default, or `unload` in router mode). The next client request hits a fresh
-process or an autoload.
+If `/health` is down, it always **restarts** the unit. Unload cannot run
+against a dead HTTP server.
+
+You do not name the running model. The router reports it on `/models`.
 
 ## Requirements
 
-- Linux with systemd
-- `llama-server` already running as `llama-server.service` (rename in config if needed)
-- `curl`, `python3`, `bash`
-- `nvidia-smi` if you keep the CUDA idle gate (default on)
-- Root (or equivalent) so the watchdog can run `systemctl restart llama-server.service`
+- Linux + systemd
+- `llama-server` already managed as a unit (default name `llama-server.service`)
+- `bash`, `curl`, `python3`
+- `nvidia-smi` if `REQUIRE_GPU_IDLE=1` (default)
+- Root, so the watchdog can restart another unit
 
 ## Files
 
@@ -40,19 +46,19 @@ process or an autoload.
 | `llama-idle-watchdog.sh` | `/usr/local/bin/llama-idle-watchdog.sh` | Main loop |
 | `llama-idle-watchdog.service` | `/etc/systemd/system/llama-idle-watchdog.service` | systemd unit |
 | `llama-idle-watchdog.default` | `/etc/default/llama-idle-watchdog` | Settings |
-| `install.sh` | run once | Copies files and enables the unit |
+| `install.sh` | run once | Install and enable |
+| `uninstall.sh` | run once | Disable and delete installed files |
 | `README.md` | this file | Documentation |
+| `INSTALL.md` | short cheat sheet | Same install commands |
 
 ## Install
 
-From the directory that contains these files:
-
 ```bash
-chmod +x install.sh llama-idle-watchdog.sh
+chmod +x install.sh uninstall.sh llama-idle-watchdog.sh
 sudo ./install.sh
 ```
 
-Manual install:
+Manual:
 
 ```bash
 sudo install -m 0755 llama-idle-watchdog.sh /usr/local/bin/llama-idle-watchdog.sh
@@ -63,7 +69,36 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now llama-idle-watchdog.service
 ```
 
-`install.sh` will not overwrite an existing `/etc/default/llama-idle-watchdog`.
+`install.sh` will **not** overwrite an existing `/etc/default/llama-idle-watchdog`.
+When updating the script later, copy only the `.sh` file.
+
+Typical host settings after install (example matching a router on GPU 0):
+
+```bash
+# /etc/default/llama-idle-watchdog
+LLAMA_URL=http://127.0.0.1:8080
+LLAMA_SERVICE=llama-server.service
+IDLE_ACTION=unload
+IDLE_SECONDS=300
+CUDA_INDEX=0
+CUDA_IDLE_MAX_PCT=0
+VERBOSE=1
+HEARTBEAT_SECONDS=60
+```
+
+```bash
+sudo systemctl restart llama-idle-watchdog.service
+```
+
+## Update the script only
+
+```bash
+sudo install -m 0755 llama-idle-watchdog.sh /usr/local/bin/llama-idle-watchdog.sh
+sudo systemctl restart llama-idle-watchdog.service
+```
+
+Do not re-copy the packaged `.default` over a tuned config or you will lose
+`CUDA_INDEX` / `IDLE_ACTION`.
 
 ## Verify
 
@@ -73,17 +108,16 @@ systemctl status llama-server.service
 journalctl -u llama-idle-watchdog.service -f
 ```
 
-Confirm GPU index:
+GPU index:
 
 ```bash
 nvidia-smi -L
-nvidia-smi -i 1 --query-gpu=index,name,utilization.gpu --format=csv
+nvidia-smi -i 0 --query-gpu=index,name,utilization.gpu --format=csv
 ```
 
-`CUDA:0` is `nvidia-smi` index `0`. If your llama-server GPU is index `0`, set
-`CUDA_INDEX=0` (see below).
+`CUDA:0` is `nvidia-smi` index `0`. Set `CUDA_INDEX` to that number.
 
-See which models the router thinks are running:
+Router catalog:
 
 ```bash
 curl -s http://127.0.0.1:8080/models | python3 -m json.tool
@@ -91,82 +125,123 @@ curl -s http://127.0.0.1:8080/models | python3 -m json.tool
 
 Look for `"status": { "value": "loaded" }` or `"loading"`.
 
-## How it works
+## Busy vs idle
 
-Every **15 seconds** the script:
-
-1. Checks that `llama-server.service` is active. If not, it resets the idle
-   clock and waits.
-2. Asks llama-server whether anything is working (see [Busy vs idle](#busy-vs-idle)).
-3. Reads GPU util for `CUDA_INDEX` via `nvidia-smi`.
-4. If the API is busy **or** the GPU is not 0%, it writes “last busy = now”.
-5. If the API is up, nothing is processing, and the GPU is 0%, idle time grows.
-6. When idle time ≥ **300 seconds**, cooldown is clear, and GPU util is still
-   **0%**, it runs `IDLE_ACTION`:
-
-   - `restart` (default): `systemctl restart llama-server.service`
-   - `unload`: `POST /models/unload` for each loaded / sleeping / loading model.
-     The router stays up; the next request can autoload.
-
-State is stored in `/var/lib/llama-idle-watchdog/`:
-
-- `state` — unix timestamp of last busy moment
-- `last_restart` — unix timestamp of last restart (120s cooldown)
-
-On first start, “last busy” is set to now so the unit is not restarted
-immediately.
-
-### Busy vs idle
-
-**Single-model server** (`-m` / `--model` set):
+**Single-model** (`-m` / `--model` set):
 
 - `GET /slots`
 - Busy if any slot has `"is_processing": true`
 
-**Router mode** (no model on the parent; your setup):
+**Router mode** (no model on the parent):
 
 - Bare `GET /slots` returns `400 model name is missing` — expected
-- Script calls `GET /models` and reads each `status.value`
-- `loading` or `downloading` → **busy** (large GGUF IO; do not restart)
+- `GET /models` → each `status.value`
+- `loading` / `downloading` → **busy** (do not unload mid-IO)
 - `loaded` → `GET /slots?model=<id>&autoload=false`
-  - `autoload=false` so inspecting slots cannot wake other models
+  - `autoload=false` so a status poll cannot wake other models
   - Busy if `"is_processing": true`
-- `sleeping` / `unloaded` → ignored
-
-You do not name the running model. The router already reports it.
+- `sleeping` / `unloaded` → not generating; `sleeping` is still unloaded when
+  `IDLE_ACTION=unload`
 
 `GET /health`, `GET /props`, `GET /models`, and `GET /metrics` are llama.cpp
-idle-exempt endpoints. Polling them does not count as user work and does not
-reset llama.cpp’s own `--sleep-idle-seconds` timer.
+idle-exempt. Polling them is not treated as user work.
 
-### CUDA:0 gate
+State files in `/var/lib/llama-idle-watchdog/`:
 
-Before every restart:
+- `state` — unix time of last busy moment
+- `last_restart` — last action time (cooldown)
+
+First start seeds “last busy” to now so it does not fire immediately.
+
+## GPU gate
 
 ```bash
-nvidia-smi -i 0 --query-gpu=utilization.gpu --format=csv,noheader,nounits
+nvidia-smi -i "$CUDA_INDEX" --query-gpu=utilization.gpu --format=csv,noheader,nounits
 ```
 
-Must be `0` (or ≤ `CUDA_IDLE_MAX_PCT`).
+Must be ≤ `CUDA_IDLE_MAX_PCT` (default `0`) before an action.
 
-If util is non-zero:
+If util is above the cap:
 
-- the idle clock resets
-- restart is skipped
-- log line: `idle timeout reached but CUDA:0 util=N% — wait for 0%`
+- idle clock resets (`reason=gpu-busy`)
+- at timeout: `idle timeout reached but CUDA:N util=X% — wait for 0%`
 
-If `nvidia-smi` is missing or the query fails, restart is skipped while
-`REQUIRE_GPU_IDLE=1`.
+`nvidia-smi` reports a snapshot. The log line reads util again, so you can
+see `reason=idle` and `cuda0=1%` on the same line. The **action** still uses
+a fresh read and will wait if that read is above the cap.
 
-### Cooldown
+If the card never reports a true `0%` (1–2% driver noise), raise the cap:
 
-After a restart, another restart is blocked for **120 seconds** so a slow model
-reload cannot loop.
+```bash
+CUDA_IDLE_MAX_PCT=2
+```
 
-### Hung server
+If `nvidia-smi` is missing and `REQUIRE_GPU_IDLE=1`, actions are skipped.
 
-If `llama-server.service` is active but `/health` does not answer, the same
-5-minute timer still applies, and the CUDA 0% check still runs before restart.
+## Logging
+
+By default the journal is quiet except start, busy events, and actions.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `VERBOSE` | `0` | `1` = a `check` line on **every** poll (~15s) |
+| `HEARTBEAT_SECONDS` | `60` | Even with `VERBOSE=0`, one `check` line this often. `0` disables |
+
+Enable live checks:
+
+```bash
+sudo sed -i 's/^VERBOSE=.*/VERBOSE=1/' /etc/default/llama-idle-watchdog
+# or append if the key is missing:
+echo 'VERBOSE=1' | sudo tee -a /etc/default/llama-idle-watchdog
+sudo systemctl restart llama-idle-watchdog.service
+journalctl -u llama-idle-watchdog.service -f
+```
+
+### Example check line
+
+```text
+check reason=idle 144s/300s cuda0=1% models=1 resident: unsloth/Qwen3.8-Flash-Next-GGUF:IQ3_XXS=loaded/idle (unloaded=5)
+```
+
+| Token | Meaning |
+| --- | --- |
+| `reason=idle 144s/300s` | No API work for 144s; action at 300s |
+| `reason=api-busy` | A slot is processing, or a model is loading |
+| `reason=gpu-busy` | GPU util above `CUDA_IDLE_MAX_PCT` |
+| `reason=service-inactive` | `llama-server.service` is not active |
+| `reason=health-down …` | Unit up, HTTP not answering |
+| `cuda0=1%` | `nvidia-smi -i 0` at log time |
+| `MODEL=loaded/idle` | Resident, not generating |
+| `MODEL=loaded/processing` | Resident, generating |
+| `MODEL=loading` | GGUF IO in progress |
+| `(unloaded=5)` | Catalog models not resident (not listed) |
+| `models=none-loaded` | Nothing in loaded / loading / sleeping |
+
+Other lines:
+
+| Line | Meaning |
+| --- | --- |
+| `started url=... action=unload cuda=0 verbose=1` | Process start, resolved config |
+| `busy: MODEL status=loading` | Load/download; clock reset |
+| `busy: MODEL is_processing=true` | Generation; clock reset |
+| `idle timeout reached but CUDA:0 util=1% — wait for 0%` | Timer done, GPU not idle |
+| `idle timeout reached but cooldown active` | Action too recent |
+| `idle for >= 300s ... — unloading models` | Unload started |
+| `unloading MODEL (status=loaded)` | `POST /models/unload` |
+| `unload MODEL: {"success": true}` | Router reply |
+| `no loaded/sleeping models to unload` | Nothing to do |
+| `idle for >= 300s ... — restarting llama-server.service` | Restart started |
+| `restart issued` | `systemctl restart` succeeded |
+
+A lone `started` line with no `check` for more than ~15s usually means
+`VERBOSE=0` and heartbeat not due yet, **or** the first poll is blocked
+(`curl` to `:8080` or `nvidia-smi`). Test:
+
+```bash
+curl -sS -m 3 http://127.0.0.1:8080/health
+curl -sS -m 3 http://127.0.0.1:8080/models | head
+nvidia-smi -i 0 --query-gpu=utilization.gpu --format=csv,noheader,nounits
+```
 
 ## Configuration
 
@@ -180,131 +255,88 @@ sudo systemctl restart llama-idle-watchdog.service
 | --- | --- | --- |
 | `LLAMA_URL` | `http://127.0.0.1:8080` | llama-server base URL |
 | `LLAMA_SERVICE` | `llama-server.service` | Unit to restart when `IDLE_ACTION=restart` |
-| `IDLE_ACTION` | `restart` | `restart` = restart the unit; `unload` = unload models via API |
-| `IDLE_SECONDS` | `600` | Idle time before restart (10 minutes) |
-| `POLL_SECONDS` | `60` | How often to poll |
-| `HEALTH_TIMEOUT` | `3` | curl timeout in seconds |
-| `COOLDOWN_SECONDS` | `120` | Minimum time between restarts |
+| `IDLE_ACTION` | `unload` | `unload` (router API) or `restart` (systemd unit) |
+| `IDLE_SECONDS` | `300` | Idle time before action |
+| `POLL_SECONDS` | `15` | Poll interval |
+| `HEALTH_TIMEOUT` | `3` | curl timeout (seconds) |
+| `COOLDOWN_SECONDS` | `120` | Minimum time between actions |
 | `REQUIRE_SERVICE_ACTIVE` | `1` | Ignore idle if the unit is not active |
 | `STATE_DIR` | `/var/lib/llama-idle-watchdog` | Timestamp files |
-| `LLAMA_MODELS` | empty | Optional comma-separated model ids; empty = all from `/models` |
-| `CUDA_INDEX` | `0` | `nvidia-smi` GPU index (`1` = CUDA:0) |
+| `LLAMA_MODELS` | empty | Optional comma-separated ids; empty = all from `/models` |
+| `CUDA_INDEX` | `0` | `nvidia-smi` GPU index (`0` = CUDA:0) |
 | `CUDA_IDLE_MAX_PCT` | `0` | Max util % treated as idle |
-| `REQUIRE_GPU_IDLE` | `1` | `1` = refuse restart unless GPU is idle |
-
-Examples:
+| `REQUIRE_GPU_IDLE` | `1` | Require GPU idle before action |
+| `VERBOSE` | `0` | `1` = log every poll |
+| `HEARTBEAT_SECONDS` | `60` | Status line interval when `VERBOSE=0` |
 
 ```bash
-# Server on port 8081
 LLAMA_URL=http://127.0.0.1:8081
-
-# Different systemd unit name
-LLAMA_SERVICE=llama-server-gpu1.service
-
-# Restart after 10 minutes instead of 5
-IDLE_SECONDS=600
-
-# GPU 0 instead of GPU 1
-CUDA_INDEX=0
-
-# Disable the GPU gate (API idle only)
-REQUIRE_GPU_IDLE=0
-
-# Unload models instead of restarting the unit (router mode)
+LLAMA_SERVICE=llama-server-gpu0.service
 IDLE_ACTION=unload
+IDLE_SECONDS=300
+CUDA_INDEX=0
+CUDA_IDLE_MAX_PCT=2
+VERBOSE=1
 ```
 
-`unload` only works in **router mode** (`POST /models/unload`). If `/health` is
-down, the script always restarts the unit because unload cannot run.
-
-## Log lines
-
-```text
-journalctl -u llama-idle-watchdog.service -f
-```
-
-| Line | Meaning |
-| --- | --- |
-| `started url=... cuda=0` | Watchdog process started |
-| `busy: MODEL status=loading` | Model IO in progress; clock reset |
-| `busy: MODEL is_processing=true` | Generation in progress; clock reset |
-| `idle timeout reached but CUDA:0 util=12% — wait for 0%` | API idle, GPU not idle |
-| `idle timeout reached but cooldown active` | Restart too recent |
-| `idle for >= 600s and CUDA:0=0% — restarting llama-server.service` | Restart issued |
-| `idle for >= 600s ... — unloading models` | Unload action started |
-| `unloading MODEL (status=loaded)` | `POST /models/unload` |
-| `restart issued` | `systemctl restart` succeeded |
-| `health down and idle Ns — restarting` | Unit up, HTTP down |
+`unload` requires router mode (`POST /models/unload`).
 
 ## Operations
 
 ```bash
-# Start / stop / restart the watchdog
 sudo systemctl start llama-idle-watchdog.service
 sudo systemctl stop llama-idle-watchdog.service
 sudo systemctl restart llama-idle-watchdog.service
-
-# Disable at boot
 sudo systemctl disable llama-idle-watchdog.service
 
-# Force a llama-server restart yourself
+# llama-server itself
 sudo systemctl restart llama-server.service
-```
-
-Update after changing the script file:
-
-```bash
-sudo install -m 0755 llama-idle-watchdog.sh /usr/local/bin/llama-idle-watchdog.sh
-sudo systemctl restart llama-idle-watchdog.service
 ```
 
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now llama-idle-watchdog.service
-sudo rm -f /etc/systemd/system/llama-idle-watchdog.service
-sudo rm -f /usr/local/bin/llama-idle-watchdog.sh
-sudo rm -f /etc/default/llama-idle-watchdog
-sudo rm -rf /var/lib/llama-idle-watchdog
-sudo systemctl daemon-reload
+chmod +x uninstall.sh
+sudo ./uninstall.sh
 ```
 
-This does not remove `llama-server.service`.
+Removes the watchdog unit, script, `/etc/default/llama-idle-watchdog`, and
+`/var/lib/llama-idle-watchdog`. Does **not** touch `llama-server.service`.
 
-## Notes and limits
+## Notes
 
-- `--sleep-idle-seconds` unloads weights **inside the same process**. After that,
-  the next request often fails on some backends. This tool restarts the
-  **process** instead.
-- A poll of `/slots` or `/models` is not treated as user traffic.
-- If a model load takes longer than `IDLE_SECONDS` **and** GPU util sits at 0%
-  the whole time (unusual), raise `IDLE_SECONDS`. Normal loads show
-  `loading`/`downloading` or non-zero GPU util and reset the clock.
-- The watchdog runs as root so it can restart another unit. Restrict the host
-  accordingly.
-- AMD / ROCm / Vulkan are not read by `nvidia-smi`. Set `REQUIRE_GPU_IDLE=0`
-  or replace `gpu_util_pct` if you are not on NVIDIA.
+- `--sleep-idle-seconds` unloads weights **inside the same process**. That
+  path is what often breaks on the next request. Prefer `IDLE_ACTION=restart`
+  if unload is not enough.
+- Watchdog polls of `/slots` and `/models` are not user traffic.
+- If a load lasts longer than `IDLE_SECONDS` with GPU at 0% the whole time,
+  raise `IDLE_SECONDS`. Normal loads show `loading` or non-zero GPU util.
+- The watchdog runs as root.
+- AMD / ROCm / Vulkan: `nvidia-smi` will not work. Set `REQUIRE_GPU_IDLE=0`.
 
 ## Troubleshooting
 
-**Watchdog active but never restarts**
+**Only a `started` line in the journal**
 
-- Traffic or `is_processing=true` keeps resetting the clock
-- `CUDA:0` is not 0% — check `nvidia-smi -i 0`
-- Wrong `CUDA_INDEX`
-- Cooldown still active after a previous restart
+- `VERBOSE=0` and heartbeat not due — set `VERBOSE=1`
+- First poll blocked — test `curl` and `nvidia-smi` as above
+- Unit running an old script — reinstall the `.sh` and restart the unit
 
-**Restarts during a load**
+**Timer reaches 300s but nothing unloads**
 
-- `/models` is not reporting `loading`/`downloading`
-- GPU util is already 0 while weights stream from disk
+- GPU util above `CUDA_IDLE_MAX_PCT` (including 1% noise)
+- Cooldown from a previous action
+- `IDLE_ACTION=unload` but no model in loaded / sleeping / loading
+
+**Unloads or restarts while you are still loading**
+
+- `/models` is not reporting `loading` / `downloading`
 - Raise `IDLE_SECONDS`
 
-**`model name is missing` in your own curls**
+**`model name is missing` on your own `GET /slots`**
 
-- Normal for bare `GET /slots` on a router. The script handles that. Use
-  `GET /models` or `GET /slots?model=ID&autoload=false`.
+- Normal on a router. Use `/models` or `/slots?model=ID&autoload=false`.
 
-**Wrong service restarted**
+**Wrong unit restarted**
 
-- Set `LLAMA_SERVICE` to the exact unit name from `systemctl list-units '*llama*'`.
+- Set `LLAMA_SERVICE` from `systemctl list-units '*llama*'`.

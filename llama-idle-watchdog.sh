@@ -22,13 +22,17 @@ set -euo pipefail
 : "${REQUIRE_SERVICE_ACTIVE:=1}"
 # Optional: comma-separated model ids. Empty = discover via GET /models
 : "${LLAMA_MODELS:=}"
-# CUDA device index to require idle before restart (1 = CUDA:1)
-: "${CUDA_INDEX:=1}"
+# CUDA device index to require idle before action (0 = CUDA:0)
+: "${CUDA_INDEX:=0}"
 # Max GPU util % allowed to treat the device as idle (0 = must be 0%)
 : "${CUDA_IDLE_MAX_PCT:=0}"
 : "${REQUIRE_GPU_IDLE:=1}"
 # idle action: restart | unload
-: "${IDLE_ACTION:=restart}"
+: "${IDLE_ACTION:=unload}"
+# 1 = log every poll (idle seconds, GPU util, reason)
+: "${VERBOSE:=0}"
+# Log a status line at least this often even when VERBOSE=0 (0 disables)
+: "${HEARTBEAT_SECONDS:=60}"
 
 STATE_FILE="${STATE_DIR}/state"
 LAST_RESTART_FILE="${STATE_DIR}/last_restart"
@@ -92,6 +96,39 @@ list_model_rows() {
     body="$(fetch /v1/models)"
   fi
   printf '%s' "$body" | parse_model_rows
+}
+
+# Compact /models + /slots line for the journal, e.g.
+# models=2 resident: qwen:Q4=loaded/idle gemma=loading
+models_summary() {
+  local mid status enc slots proc n_loaded=0 n_other=0 bits=""
+  while IFS=$'\t' read -r mid status; do
+    [[ -z "$mid" ]] && continue
+    case "$status" in
+      loaded|loading|downloading|sleeping)
+        n_loaded=$((n_loaded + 1))
+        proc=""
+        if [[ "$status" == "loaded" ]]; then
+          enc="$(urlencode "$mid")"
+          slots="$(fetch "/slots?model=${enc}&autoload=false")"
+          if slots_body_busy "$slots"; then
+            proc="/processing"
+          else
+            proc="/idle"
+          fi
+        fi
+        bits="${bits} ${mid}=${status}${proc}"
+        ;;
+      *)
+        n_other=$((n_other + 1))
+        ;;
+    esac
+  done < <(list_model_rows)
+  if [[ -z "$bits" ]]; then
+    printf 'models=none-loaded (unloaded=%s)' "$n_other"
+  else
+    printf 'models=%s resident:%s (unloaded=%s)' "$n_loaded" "$bits" "$n_other"
+  fi
 }
 
 slots_body_busy() {
@@ -239,13 +276,7 @@ take_idle_action() {
   fi
 
   case "$IDLE_ACTION" in
-    unload)
-      log "idle for >= ${IDLE_SECONDS}s and CUDA:${CUDA_INDEX}=$(gpu_util_pct)% — unloading models"
-      unload_loaded_models
-      mark_restart
-      write_last_busy "$(now)"
-      ;;
-    restart|*)
+    restart)
       log "idle for >= ${IDLE_SECONDS}s and CUDA:${CUDA_INDEX}=$(gpu_util_pct)% — restarting ${LLAMA_SERVICE}"
       if systemctl restart "$LLAMA_SERVICE"; then
         mark_restart
@@ -255,6 +286,12 @@ take_idle_action() {
         log "systemctl restart failed"
       fi
       ;;
+    unload|*)
+      log "idle for >= ${IDLE_SECONDS}s and CUDA:${CUDA_INDEX}=$(gpu_util_pct)% — unloading models"
+      unload_loaded_models
+      mark_restart
+      write_last_busy "$(now)"
+      ;;
   esac
 }
 
@@ -263,35 +300,45 @@ if [[ ! -f "$STATE_FILE" ]]; then
   write_last_busy "$(now)"
 fi
 
-log "started url=${LLAMA_URL} service=${LLAMA_SERVICE} action=${IDLE_ACTION} idle=${IDLE_SECONDS}s poll=${POLL_SECONDS}s cuda=${CUDA_INDEX}"
+log "started url=${LLAMA_URL} service=${LLAMA_SERVICE} action=${IDLE_ACTION} idle=${IDLE_SECONDS}s poll=${POLL_SECONDS}s cuda=${CUDA_INDEX} verbose=${VERBOSE}"
+log "next: poll API + nvidia-smi -i ${CUDA_INDEX} (quiet unless VERBOSE=1; heartbeat every ${HEARTBEAT_SECONDS}s)"
+
+last_heartbeat=0
 
 while true; do
+  reason="idle"
   if [[ "$REQUIRE_SERVICE_ACTIVE" == "1" ]] && ! service_active; then
     write_last_busy "$(now)"
-    sleep "$POLL_SECONDS"
-    continue
-  fi
-
-  if is_processing; then
+    reason="service-inactive"
+  elif is_processing; then
     write_last_busy "$(now)"
+    reason="api-busy"
   elif [[ "$REQUIRE_GPU_IDLE" == "1" ]] && ! gpu_is_idle; then
-    # GPU still computing (IO / kernels) even if /slots looks idle
     write_last_busy "$(now)"
+    reason="gpu-busy"
   elif server_up; then
     last="$(read_last_busy)"
     idle=$(( $(now) - last ))
+    reason="idle ${idle}s/${IDLE_SECONDS}s"
     if (( idle >= IDLE_SECONDS )); then
       take_idle_action
+      reason="idle-action"
     fi
   else
-    # Server not answering health — leave last-busy alone so a dead hang
-    # still trips the idle restart once IDLE_SECONDS has passed since last work.
     last="$(read_last_busy)"
     idle=$(( $(now) - last ))
+    reason="health-down ${idle}s/${IDLE_SECONDS}s"
     if service_active && (( idle >= IDLE_SECONDS )); then
       log "health down and idle ${idle}s — forcing restart"
       IDLE_ACTION=restart take_idle_action
+      reason="health-down-restart"
     fi
+  fi
+
+  now_ts="$(now)"
+  if [[ "$VERBOSE" == "1" ]] || (( HEARTBEAT_SECONDS > 0 && now_ts - last_heartbeat >= HEARTBEAT_SECONDS )); then
+    log "check reason=${reason} cuda${CUDA_INDEX}=$(gpu_util_pct)% $(models_summary)"
+    last_heartbeat="$now_ts"
   fi
 
   sleep "$POLL_SECONDS"

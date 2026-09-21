@@ -9,10 +9,10 @@ LLAMA_SERVICE=llama-server.service
 IDLE_ACTION=unload
 
 # Seconds with no work before taking IDLE_ACTION
-IDLE_SECONDS=600
+IDLE_SECONDS=300
 
 # How often to poll
-POLL_SECONDS=60
+POLL_SECONDS=15
 
 # curl timeout for /health and /slots
 HEALTH_TIMEOUT=3
@@ -27,7 +27,12 @@ STATE_DIR=/var/lib/llama-idle-watchdog
 # Or set comma-separated ids, e.g. org/model:Q4_K_M
 LLAMA_MODELS=
 
-# Require this NVIDIA GPU to be 0% util before restart (1 = CUDA:1)
+# Require this NVIDIA GPU to be idle before action (0 = CUDA:0)
 CUDA_INDEX=0
 CUDA_IDLE_MAX_PCT=0
 REQUIRE_GPU_IDLE=1
+
+# 1 = log every poll to the journal (idle time, GPU %, reason)
+VERBOSE=1
+# Even with VERBOSE=0, write a status line this often (seconds). 0 = off.
+HEARTBEAT_SECONDS=60
